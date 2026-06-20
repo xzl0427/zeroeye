@@ -18,6 +18,7 @@ following the power-law distributions seen in real markets.
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -25,6 +26,7 @@ import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -75,6 +77,111 @@ LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Mille
 DOMAINS = ["example.com", "test.org", "demo.net", "sample.io", "mock.dev",
            "fictitious.co", "imaginary.app", "pretend.tech", "dummy.biz",
            "simulated.com", "testmail.com", "inbox.test"]
+
+MANIFEST_VERSION = 1
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def count_json_records(path: Path) -> int:
+    with path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        return sum(len(value) for value in data.values() if isinstance(value, list))
+    return 1
+
+
+def count_csv_records(path: Path) -> int:
+    with path.open(newline="", encoding="utf-8") as f:
+        return sum(1 for _ in csv.DictReader(f))
+
+
+def count_records(path: Path) -> int:
+    if path.suffix == ".json":
+        return count_json_records(path)
+    if path.suffix == ".csv":
+        return count_csv_records(path)
+    return 0
+
+
+def dataset_manifest_path(path: Path, output_dir: Path) -> str:
+    return path.relative_to(output_dir).as_posix()
+
+
+def build_manifest(args: argparse.Namespace, output_dir: Path, generated_files: List[Path]) -> Dict[str, Any]:
+    files = []
+    for path in sorted(generated_files, key=lambda p: dataset_manifest_path(p, output_dir)):
+        files.append({
+            "path": dataset_manifest_path(path, output_dir),
+            "bytes": path.stat().st_size,
+            "records": count_records(path),
+            "sha256": sha256_file(path),
+        })
+
+    return {
+        "manifest_version": MANIFEST_VERSION,
+        "generator": "tools/data_generator.py",
+        "arguments": {
+            "output_dir": str(output_dir),
+            "seed": args.seed,
+            "users": args.users,
+            "orders": args.orders,
+            "trades": args.trades,
+            "ticks": args.ticks,
+            "candles": args.candles,
+            "format": args.format,
+        },
+        "files": files,
+    }
+
+
+def write_manifest(path: Path, manifest: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"Wrote manifest {path} ({len(manifest['files'])} files)")
+
+
+def verify_manifest(manifest_path: Path) -> bool:
+    with manifest_path.open(encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    base_dir = Path(manifest["arguments"]["output_dir"])
+    ok = True
+    for entry in manifest.get("files", []):
+        rel_path = entry["path"]
+        path = base_dir / rel_path
+        if not path.exists():
+            print(f"Manifest verification failed: missing {rel_path}", file=sys.stderr)
+            ok = False
+            continue
+
+        actual_bytes = path.stat().st_size
+        actual_records = count_records(path)
+        actual_sha256 = sha256_file(path)
+        if actual_bytes != entry["bytes"]:
+            print(f"Manifest verification failed: {rel_path} bytes {actual_bytes} != {entry['bytes']}", file=sys.stderr)
+            ok = False
+        if actual_records != entry["records"]:
+            print(f"Manifest verification failed: {rel_path} records {actual_records} != {entry['records']}", file=sys.stderr)
+            ok = False
+        if actual_sha256 != entry["sha256"]:
+            print(f"Manifest verification failed: {rel_path} sha256 mismatch", file=sys.stderr)
+            ok = False
+
+    if ok:
+        print(f"Manifest verified: {manifest_path}")
+    return ok
+
 
 def gaussian_random(mean: float, stddev: float) -> float:
     return random.gauss(mean, stddev)
@@ -274,21 +381,23 @@ class DataGenerator:
 
         return candles
 
-    def export_json(self, filepath: str, data: Any):
+    def export_json(self, filepath: str, data: Any) -> Path:
         with open(filepath, "w") as f:
             json.dump(data, f, indent=2, default=str)
         print(f"Exported {filepath} ({os.path.getsize(filepath)} bytes)")
+        return Path(filepath)
 
-    def export_csv(self, filepath: str, data: List[Dict], fieldnames: Optional[List[str]] = None):
+    def export_csv(self, filepath: str, data: List[Dict], fieldnames: Optional[List[str]] = None) -> Optional[Path]:
         if not data:
             print(f"No data to export for {filepath}")
-            return
+            return None
         fn = fieldnames or list(data[0].keys())
         with open(filepath, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fn, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(data)
         print(f"Exported {filepath} ({os.path.getsize(filepath)} bytes, {len(data)} rows)")
+        return Path(filepath)
 
 
 def parse_args():
@@ -303,14 +412,20 @@ def parse_args():
     parser.add_argument("--json", action="store_true", help="Export as JSON")
     parser.add_argument("--csv", action="store_true", help="Export as CSV")
     parser.add_argument("--format", choices=["json", "csv", "both"], default="json", help="Output format")
+    parser.add_argument("--manifest", help="Write deterministic JSON manifest for generated files")
+    parser.add_argument("--verify-manifest", help="Verify current files against an existing manifest")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    if args.verify_manifest:
+        return 0 if verify_manifest(Path(args.verify_manifest)) else 1
+
     gen = DataGenerator(args.seed)
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Generating test data with seed {args.seed}...")
 
@@ -341,26 +456,31 @@ def main():
             key = f"{inst['symbol']}_{interval}min"
             all_candles[key] = candles
 
-    output_format = args.format
-    if output_format == "both":
-        output_format = "json"  # Default for combined
-
     # Export
-    if output_format in ("json", "both"):
-        gen.export_json(os.path.join(args.output_dir, "users.json"), users)
-        gen.export_json(os.path.join(args.output_dir, "orders.json"), orders)
-        gen.export_json(os.path.join(args.output_dir, "trades.json"), trades)
-        gen.export_json(os.path.join(args.output_dir, "ticks.json"), all_ticks)
-        gen.export_json(os.path.join(args.output_dir, "candles.json"), all_candles)
-        gen.export_json(os.path.join(args.output_dir, "instruments.json"), gen.instruments)
+    generated_files: List[Path] = []
+    if args.format in ("json", "both"):
+        generated_files.extend([
+            gen.export_json(str(output_dir / "users.json"), users),
+            gen.export_json(str(output_dir / "orders.json"), orders),
+            gen.export_json(str(output_dir / "trades.json"), trades),
+            gen.export_json(str(output_dir / "ticks.json"), all_ticks),
+            gen.export_json(str(output_dir / "candles.json"), all_candles),
+            gen.export_json(str(output_dir / "instruments.json"), gen.instruments),
+        ])
 
-    if output_format in ("csv", "both"):
-        gen.export_csv(os.path.join(args.output_dir, "users.csv"), users)
-        gen.export_csv(os.path.join(args.output_dir, "orders.csv"), orders)
-        gen.export_csv(os.path.join(args.output_dir, "trades.csv"), trades)
+    if args.format in ("csv", "both"):
+        generated_files.extend(path for path in [
+            gen.export_csv(str(output_dir / "users.csv"), users),
+            gen.export_csv(str(output_dir / "orders.csv"), orders),
+            gen.export_csv(str(output_dir / "trades.csv"), trades),
+        ] if path is not None)
 
-    print(f"\nAll data generated in {args.output_dir}/")
+    if args.manifest:
+        write_manifest(Path(args.manifest), build_manifest(args, output_dir, generated_files))
+
+    print(f"\nAll data generated in {output_dir}/")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

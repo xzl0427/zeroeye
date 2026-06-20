@@ -52,3 +52,40 @@ gpg -d backup/tent_production_20240101.sql.gz | gunzip | psql -h localhost tent_
 ```
 
 The GPG key ID is stored in the team vault under `secret/database/backup-key`.
+
+## Generated Data Manifest
+
+`tools/data_generator.py` can write a deterministic manifest for generated test
+data:
+
+```bash
+python3 tools/data_generator.py \
+  --output-dir data/test \
+  --seed 42 \
+  --format both \
+  --manifest data/test/manifest.json
+```
+
+The manifest is a JSON object with:
+
+| Field | Description |
+| --- | --- |
+| `manifest_version` | Manifest schema version. |
+| `generator` | Generator script path. |
+| `arguments` | Generator arguments, including output directory, seed, counts, and format. |
+| `files` | Deterministically sorted generated file entries. |
+
+Each `files` entry contains:
+
+| Field | Description |
+| --- | --- |
+| `path` | File path relative to the generated output directory. |
+| `bytes` | File size in bytes. |
+| `records` | Record count. JSON arrays count array items, JSON objects count nested list items, and CSV files count data rows. |
+| `sha256` | SHA-256 checksum of the generated file. |
+
+To verify existing files against a manifest:
+
+```bash
+python3 tools/data_generator.py --verify-manifest data/test/manifest.json
+```
