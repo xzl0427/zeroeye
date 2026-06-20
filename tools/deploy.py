@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,7 +36,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -111,6 +112,24 @@ ENVIRONMENTS = {
 
 ROLLBACK_VERSIONS: Dict[str, List[str]] = {}
 
+SENSITIVE_KEY_TERMS = (
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "private",
+    "api_key",
+    "apikey",
+    "access_key",
+    "auth",
+    "authorization",
+)
+
+SECRET_VALUE_PATTERNS = (
+    re.compile(r"(?i)\b(token|secret|password|credential|api[_-]?key|access[_-]?key)=([^\s,;]+)"),
+    re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"),
+)
+
 
 def load_deployment_history(env: str) -> List[Dict]:
     history_file = f".deploy_history_{env}.json"
@@ -123,6 +142,55 @@ def load_deployment_history(env: str) -> List[Dict]:
 def save_deployment_history(env: str, history: List[Dict]):
     with open(f".deploy_history_{env}.json", "w") as f:
         json.dump(history, f, indent=2)
+
+
+def is_sensitive_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    return any(term in normalized for term in SENSITIVE_KEY_TERMS)
+
+
+def redact_string(value: str) -> str:
+    redacted = value
+    for pattern in SECRET_VALUE_PATTERNS:
+        if pattern.pattern.startswith("(?i)\\b(bearer"):
+            redacted = pattern.sub(lambda match: f"{match.group(1)} ***REDACTED***", redacted)
+        else:
+            redacted = pattern.sub(lambda match: f"{match.group(1)}=***REDACTED***", redacted)
+    return redacted
+
+
+def redact_history_value(value: Any, key: str = "") -> Any:
+    if key and is_sensitive_key(key):
+        return "***REDACTED***"
+    if isinstance(value, dict):
+        return {item_key: redact_history_value(item_value, item_key)
+                for item_key, item_value in value.items()}
+    if isinstance(value, list):
+        return [redact_history_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_string(value)
+    return value
+
+
+def normalize_deployment_entry(entry: Dict[str, Any], env: str) -> Dict[str, Any]:
+    normalized = {
+        "service": entry.get("service", "unknown"),
+        "environment": entry.get("environment", env),
+        "version": entry.get("version", entry.get("tag", "")),
+        "timestamp": entry.get("timestamp", ""),
+        "status": entry.get("status", "unknown"),
+    }
+    operator = entry.get("operator", entry.get("deployed_by"))
+    if operator is not None:
+        normalized["operator"] = operator
+    return redact_history_value(normalized)
+
+
+def deployment_history_for_export(env: str, service: Optional[str] = None) -> List[Dict[str, Any]]:
+    history = load_deployment_history(env)
+    if service:
+        history = [entry for entry in history if entry.get("service") == service]
+    return [normalize_deployment_entry(entry, env) for entry in history]
 
 
 # ---------------------------------------------------------------------------
@@ -354,17 +422,22 @@ def rollback_service(service: str, env: str, version: str) -> bool:
                           skip_build=True, skip_test=True, skip_health=False)
 
 
-def list_deployments(env: str, service: Optional[str] = None):
-    history = load_deployment_history(env)
-    if service:
-        history = [d for d in history if d["service"] == service]
+def list_deployments(env: str, service: Optional[str] = None,
+                     output_format: str = "text"):
+    history = deployment_history_for_export(env, service)
+
+    if output_format == "json":
+        print(json.dumps(history, indent=2, sort_keys=True))
+        return
 
     print(f"\nDeployment history for {env}:")
-    print(f"{'Timestamp':<25} {'Service':<15} {'Version':<15} {'Status':<15}")
-    print("-" * 70)
+    print(f"{'Timestamp':<25} {'Service':<15} {'Version':<15} "
+          f"{'Status':<15} {'Operator':<15}")
+    print("-" * 88)
     for entry in history[-20:]:
         print(f"{entry['timestamp']:<25} {entry['service']:<15} "
-              f"{entry['version']:<15} {entry['status']:<15}")
+              f"{entry['version']:<15} {entry['status']:<15} "
+              f"{entry.get('operator', ''):<15}")
     print()
 
 
@@ -382,6 +455,8 @@ def parse_args():
     parser.add_argument("--rollback", action="store_true", help="Rollback instead of deploy")
     parser.add_argument("--version", help="Version to rollback to")
     parser.add_argument("--list", action="store_true", help="List deployments")
+    parser.add_argument("--format", choices=["text", "json"], default="text",
+                       help="Output format for deployment history")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
@@ -391,7 +466,8 @@ def main():
     args = parse_args()
 
     if args.list:
-        list_deployments(args.env, args.service if args.service != "all" else None)
+        list_deployments(args.env, args.service if args.service != "all" else None,
+                         args.format)
         return 0
 
     if args.rollback:
@@ -435,9 +511,10 @@ def main():
         history.append({
             "timestamp": datetime.now().isoformat(),
             "service": service,
+            "environment": args.env,
             "version": args.tag,
             "status": "success" if success else "failed",
-            "deployed_by": os.environ.get("USER", "unknown"),
+            "operator": os.environ.get("USER", "unknown"),
         })
         save_deployment_history(args.env, history)
 

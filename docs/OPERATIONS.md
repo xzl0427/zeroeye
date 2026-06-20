@@ -121,6 +121,23 @@ During an incident, use the following channels:
 | PagerDuty | On-call engineer notification |
 | Email | Stakeholder updates (SEV1 only) |
 
+## Deployment History Export
+
+The legacy deployment script stores local audit history in
+`.deploy_history_<environment>.json`. Operators can export that history without
+scraping terminal tables:
+
+```bash
+python3 tools/deploy.py --env staging --list
+python3 tools/deploy.py --env staging --service backend --list
+python3 tools/deploy.py --env production --list --format json
+```
+
+JSON exports include `service`, `environment`, `version`, `timestamp`,
+`status`, and `operator` when the operator is available. Secret-looking fields
+from older history entries, such as tokens, passwords, credentials, access keys,
+and inline `token=value` notes, are redacted before export.
+
 ## Backup and Recovery
 
 ### Backup Schedule
