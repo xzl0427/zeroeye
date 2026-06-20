@@ -85,6 +85,18 @@ python3 build.py --module backend,frontend  # Build specific modules
 python3 build.py --release    # Release mode (Rust only)
 ```
 
+## Configuration generator
+
+`tools/config_generator.py` writes environment configuration in YAML, JSON,
+TOML, dotenv, or Kubernetes ConfigMap format. By default it redacts values for
+keys whose names contain `TOKEN`, `SECRET`, `KEY`, `PASSWORD`, or `CREDENTIAL`
+case-insensitively, including nested dictionaries, list values, flattened
+dotenv names, ConfigMap keys, and diagnostic error messages. Non-sensitive keys
+remain visible so generated previews are still useful.
+
+Use `--show-sensitive` only when intentionally writing a private configuration
+file to a protected location.
+
 ### Build diagnostics
 
 Each build writes a diagnostic bundle into the git-tracked `diagnostic/` directory. The encrypted log is named from the current commit's first 4 bytes, so it remains constant for the same commit: `build-<commit-4-bytes>.logd` (for example, `build-1a2b3c4d.logd`). It is accompanied by matching metadata (`build-<commit-4-bytes>-metadata.json`) that includes the decrypt password and module results.

@@ -24,6 +24,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -166,10 +167,8 @@ ENV_OVERRIDES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-SENSITIVE_KEYS = [
-    "database.password", "redis.password", "auth.jwt_secret",
-    "auth.jwt_secret", "auth.jwt_secret",
-]
+REDACTED_VALUE = "***REDACTED***"
+SENSITIVE_KEY_TERMS = ("token", "secret", "key", "password", "credential")
 
 
 def merge_config(base: Dict, override: Dict) -> Dict:
@@ -191,17 +190,49 @@ def generate_config(env: str, overrides: Optional[Dict] = None) -> Dict:
     return config
 
 
-def mask_sensitive(config: Dict, prefix: str = "") -> Dict:
-    masked = {}
-    for key, value in config.items():
-        full_key = f"{prefix}.{key}" if prefix else key
-        if full_key in SENSITIVE_KEYS:
-            masked[key] = "***REDACTED***"
-        elif isinstance(value, dict):
-            masked[key] = mask_sensitive(value, full_key)
-        else:
-            masked[key] = value
-    return masked
+def is_sensitive_key(key: str) -> bool:
+    normalized = key.lower()
+    return any(term in normalized for term in SENSITIVE_KEY_TERMS)
+
+
+def mask_sensitive_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: mask_sensitive_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [mask_sensitive_value(item) for item in value]
+    return REDACTED_VALUE
+
+
+def mask_sensitive(config: Any) -> Any:
+    if isinstance(config, dict):
+        masked = {}
+        for key, value in config.items():
+            if is_sensitive_key(str(key)):
+                masked[key] = mask_sensitive_value(value)
+            else:
+                masked[key] = mask_sensitive(value)
+        return masked
+    if isinstance(config, list):
+        return [mask_sensitive(item) for item in config]
+    return config
+
+
+def mask_sensitive_text(text: str) -> str:
+    def redact_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if is_sensitive_key(token):
+            return REDACTED_VALUE
+        if "=" in token:
+            key, _value = token.split("=", 1)
+            if is_sensitive_key(key):
+                return f"{key}={REDACTED_VALUE}"
+        if ":" in token:
+            key, _value = token.split(":", 1)
+            if is_sensitive_key(key):
+                return f"{key}:{REDACTED_VALUE}"
+        return token
+
+    return re.sub(r"[A-Za-z0-9_.-]+(?:[=:][^\s,'\"]+)?", redact_token, text)
 
 
 def to_yaml(config: Dict) -> str:
@@ -335,16 +366,20 @@ def main():
 
     output_fn = format_map.get(args.format)
     if not output_fn:
-        print(f"Unsupported format: {args.format}")
+        print(mask_sensitive_text(f"Unsupported format: {args.format}"))
         return 1
 
     output = output_fn(display_config)
     if args.stdout or not args.output:
         print(output)
     else:
-        with open(args.output, "w") as f:
-            f.write(output)
-        print(f"Configuration written to {args.output}")
+        try:
+            with open(args.output, "w") as f:
+                f.write(output)
+        except OSError as exc:
+            print(mask_sensitive_text(f"Failed to write configuration to {args.output}: {exc}"), file=sys.stderr)
+            return 1
+        print(mask_sensitive_text(f"Configuration written to {args.output}"))
 
     return 0
 
