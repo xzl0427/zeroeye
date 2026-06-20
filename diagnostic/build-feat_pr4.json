@@ -1,0 +1,12 @@
+{
+    "passed":  0,
+    "modules":  [
+
+                ],
+    "generated_at":  "2026-06-20T23:01:33.189+08:00",
+    "diagnostic_logd":  null,
+    "pr_note":  "Build artifacts generated on Windows dev machine. Full build requires Unix toolchain (Rust, Go, Java, Haskell, Lua, Ruby, CMake). Changes are scoped to tools/log_aggregator.py which is a standalone Python script.",
+    "total_modules":  0,
+    "commit":  "feat/parse-error-report",
+    "failed":  0
+}
