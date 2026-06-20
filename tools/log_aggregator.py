@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Legacy log aggregator and analysis tool for the Tent of Trials platform.
 
@@ -30,6 +30,7 @@ Usage:
     python3 log_aggregator.py --from-s3 s3://logs-bucket/production/ --date 2024-01-15
     python3 log_aggregator.py --analyze --window 1h --group-by service
     python3 log_aggregator.py --stream --filter 'severity:error'
+    python3 log_aggregator.py --input *.log --parse-error-report parse_errors.json
 """
 
 import argparse
@@ -131,6 +132,8 @@ class JSONLogParser(LogParser):
             }
         except json.JSONDecodeError:
             return None
+        except Exception:
+            return None
 
 
 class TextLogParser(LogParser):
@@ -212,24 +215,114 @@ class LogAggregator:
         self.error_patterns: Counter = Counter()
         self.top_errors: Counter = Counter()
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
+        # Parse-failure tracking for --parse-error-report
+        self.parse_failures: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self._json_parser_id = 'JSONLogParser'
 
     def process_file(self, filepath: str) -> int:
+        """Process a single log file, tracking parse failures by line number."""
         parsed_count = 0
+        json_parser = JSONLogParser()
+        # Clear any prior failures for this file
+        self.parse_failures[filepath] = []
         try:
             if filepath.endswith('.gz'):
                 with gzip.open(filepath, 'rt', errors='replace') as f:
-                    for line in f:
+                    for line_no, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        # Track JSON parse failures specifically
+                        if json_parser.parse(line) is None:
+                            # Not a JSON line – could be plain text or malformed
+                            self._record_parse_failure(
+                                filepath, line_no, self._json_parser_id,
+                                'JSON parse error - malformed record'
+                            )
                         if self._parse_line(line):
                             parsed_count += 1
+                        else:
+                            self._record_parse_failure(
+                                filepath, line_no, 'all',
+                                'unparseable content - no parser returned a match'
+                            )
             else:
                 with open(filepath, 'r', errors='replace') as f:
-                    for line in f:
+                    for line_no, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if json_parser.parse(line) is None:
+                            self._record_parse_failure(
+                                filepath, line_no, self._json_parser_id,
+                                'JSON parse error - malformed record'
+                            )
                         if self._parse_line(line):
                             parsed_count += 1
+                        else:
+                            self._record_parse_failure(
+                                filepath, line_no, 'all',
+                                'unparseable content - no parser returned a match'
+                            )
         except Exception as e:
             logger.error(f"Error processing {filepath}: {e}")
 
         return parsed_count
+
+    def _record_parse_failure(self, filepath: str, line_no: int,
+                              parser_type: str, error_message: str):
+        """Record a sanitized parse failure without leaking log payloads."""
+        failure = {
+            'file': filepath,
+            'line': line_no,
+            'parser_type': parser_type,
+            'error': error_message,
+        }
+        self.parse_failures[filepath].append(failure)
+
+    def get_parse_failure_report(self) -> Dict[str, Any]:
+        """Build a sanitized summary of all parse failures."""
+        total_failures = sum(len(v) for v in self.parse_failures.values())
+        total_entries = len(self.entries)
+        failures_by_parser = Counter()
+        failures_by_file = Counter()
+
+        for filepath, failures in self.parse_failures.items():
+            failures_by_file[filepath] += len(failures)
+            for f in failures:
+                failures_by_parser[f.get('parser_type', 'unknown')] += 1
+
+        return {
+            'total_parse_failures': total_failures,
+            'total_parsed_entries': total_entries,
+            'failure_rate_pct': round(
+                total_failures / max(total_entries + total_failures, 1) * 100, 2
+            ),
+            'by_file': {
+                filepath: {
+                    'failure_count': count,
+                    'failures': self.parse_failures[filepath],
+                }
+                for filepath, count in failures_by_file.most_common()
+            },
+            'by_parser_type': dict(failures_by_parser.most_common()),
+            'note': (
+                'Parse failures are tracked for each file during processing. '
+                'Error messages are sanitized and do not include raw log payloads '
+                'or secret-looking values.'
+            ),
+        }
+
+    def export_parse_error_report(self, output_path: str):
+        """Write the parse-failure report to a JSON file."""
+        report = self.get_parse_failure_report()
+        with open(output_path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        logger.info(
+            f"Parse-error report exported to {output_path} "
+            f"({report['total_parse_failures']} failures, "
+            f"{report['total_parsed_entries']} parsed entries)"
+        )
 
     def process_directory(self, dirpath: str, pattern: str = "*.log") -> int:
         total = 0
@@ -412,6 +505,8 @@ def parse_args():
     parser.add_argument("--format", choices=["json", "csv", "html"], default="json", help="Output format")
     parser.add_argument("--search", help="Search for a string in logs")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--parse-error-report", type=str, default=None,
+                        help="Path to write a JSON parse-error report (sanitized)")
     return parser.parse_args()
 
 
@@ -451,6 +546,9 @@ def main():
     print(f"  Error rate: {summary.get('error_rate', 0)}%")
     print(f"  By level: {', '.join(f'{k}={v}' for k, v in summary.get('by_level', {}).items())}")
     print(f"  By service: {', '.join(f'{k}={v}' for k, v in summary.get('by_service', {}).items())}")
+
+    if args.parse_error_report:
+        aggregator.export_parse_error_report(args.parse_error_report)
 
     if args.format == "csv":
         aggregator.export_csv(args.output)
